@@ -1,95 +1,164 @@
 using EmployeeHierarchy.Domain.Dtos;
 using EmployeeHierarchy.Domain.Entities;
 using EmployeeHierarchy.Domain.Interfaces;
-using EmployeeHierarchy.Infrastructure.Context;
-using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Win32.SafeHandles;
+using Npgsql;
+using System.Data;
 
 namespace EmployeeHierarchy.Infrastructure.Repos
 {
-    public class EmployeeRepositoryWithAdonet : IEmployeeRepository
+    public class EmployeeRepositoryWithAdonet(IConfiguration configuration) : IEmployeeRepository
     {
-        private readonly EmployeeDbContext _context;
-
-        public EmployeeRepositoryWithAdonet(EmployeeDbContext dbContext)
-        {
-            _context = dbContext;
-        }
-
+        private readonly string _connectionString = configuration.GetConnectionString("DefaultConnection");
         public async Task<int> CreateOrUpdateEmployee(Employee employee)
         {
-            var employeeData = await _context.Employees.FindAsync(employee.EmployeeId);
-            if (employeeData == null)
+            using (var connection = new NpgsqlConnection(_connectionString))
             {
-                employeeData = new EmployeeData
+                await connection.OpenAsync();
+                using (var transaction = await connection.BeginTransactionAsync())
                 {
-                    FullName = employee.FullName,
-                    Title = employee.Title,
-                    ManagerEmployeeId = employee.ManagerEmployeeId
-                };
-                _context.Employees.Add(employeeData);
-            }
-            else
-            {
-                employeeData.FullName = employee.FullName;
-                employeeData.Title = employee.Title;
-                employeeData.ManagerEmployeeId = employee.ManagerEmployeeId;
-                _context.Employees.Update(employeeData);
-            }
+                    try
+                    {
+                        using var command = new NpgsqlCommand(
+                            @"INSERT INTO ""Employees"" (""EmployeeId"",""FullName"", ""Title"", ""ManagerEmployeeId"")
+                  VALUES (@EmployeeId,@FullName, @Title, @ManagerEmployeeId)
+                  ON CONFLICT (""EmployeeId"") DO UPDATE
+                  SET ""FullName"" = @FullName, ""Title"" = @Title, ""ManagerEmployeeId"" = @ManagerEmployeeId
+                  RETURNING ""EmployeeId""", connection);
 
-            await _context.SaveChangesAsync();
-            return employeeData.EmployeeId;
+                        command.Parameters.AddWithValue("@EmployeeId", employee.EmployeeId == 0 ? (object)DBNull.Value : employee.EmployeeId);
+                        command.Parameters.AddWithValue("@FullName", employee.FullName);
+                        command.Parameters.AddWithValue("@Title", employee.Title);
+                        command.Parameters.AddWithValue("@ManagerEmployeeId", employee.ManagerEmployeeId ?? (object)DBNull.Value);
+
+                        //if (employee.EmployeeId != 0)
+                        //    command.Parameters.AddWithValue("@EmployeeId", employee.EmployeeId);
+
+                        var result = await command.ExecuteScalarAsync();
+                        await transaction.CommitAsync();
+                        await connection.CloseAsync();
+                        return Convert.ToInt32(result);
+                    }
+                    catch (Exception ex)
+                    {
+                        await transaction.RollbackAsync();
+                        await connection.CloseAsync();
+                        throw;
+                    }
+                }
+            }
         }
 
         public async Task<bool> DeleteEmployee(int id)
         {
-            var employee = await _context.Employees
-                .FirstOrDefaultAsync(e => e.EmployeeId == id);
 
-            if (employee != null)
+            using (var connection = new NpgsqlConnection(_connectionString))
             {
-
-                if (_context.Employees.Any(x => x.ManagerEmployeeId == employee.EmployeeId))
+                await connection.OpenAsync();
+                using (var transaction = await connection.BeginTransactionAsync())
                 {
-                    var subEmployees = _context.Employees.Where(x => x.ManagerEmployeeId == employee.EmployeeId).ToList();
-                    foreach (var subEmployee in subEmployees)
+                    try
                     {
-                        subEmployee.ManagerEmployeeId = employee.ManagerEmployeeId;
+                        // Update managed employees
+                        using (var updateCommand = new NpgsqlCommand(
+                            @"UPDATE ""Employees""
+                      SET ""ManagerEmployeeId"" = (SELECT ""ManagerEmployeeId"" FROM ""Employees"" WHERE ""EmployeeId"" = @EmployeeId)
+                      WHERE ""ManagerEmployeeId"" = @EmployeeId", connection, transaction))
+                        {
+                            updateCommand.Parameters.AddWithValue("@EmployeeId", id);
+                            await updateCommand.ExecuteNonQueryAsync();
+                        }
+
+                        // Delete the employee
+                        using (var deleteCommand = new NpgsqlCommand(
+                            @"DELETE FROM ""Employees"" WHERE ""EmployeeId"" = @EmployeeId", connection, transaction))
+                        {
+                            deleteCommand.Parameters.AddWithValue("@EmployeeId", id);
+                            var rowsAffected = await deleteCommand.ExecuteNonQueryAsync();
+
+                            await transaction.CommitAsync();
+                            return rowsAffected > 0;
+                        }
                     }
-                    _context.UpdateRange(subEmployees);
+                    catch (Exception ex)
+                    {
+                        await transaction.RollbackAsync();
+                        await connection.CloseAsync();
+                        throw;
+                    }
                 }
-                _context.Employees.Remove(employee);//only this object
-                await _context.SaveChangesAsync();
-                return true;
             }
-            return false;
         }
 
         public async Task<Employee> GetEmployeeById(int id)
         {
-            var employeeData = _context.Employees
-            .FirstOrDefault(e => e.EmployeeId == id);
-            var employee = new Employee(employeeData);
-            employee.ManagedEmployees = await LoadManagedEmployeesRecursively(id);
-            return employee;
+            using (var connection = new NpgsqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+                using var command = new NpgsqlCommand(
+                    @"SELECT ""EmployeeId"", ""FullName"", ""Title"", ""ManagerEmployeeId""
+                  FROM ""Employees""
+                  WHERE ""EmployeeId"" = @EmployeeId", connection);
+                command.Parameters.AddWithValue("@EmployeeId", id);
+
+                using var reader = await command.ExecuteReaderAsync();
+                if (await reader.ReadAsync())
+                {
+                    var employee = new Employee
+                    {
+                        EmployeeId = reader.GetInt32(0),
+                        FullName = reader.GetString(1),
+                        Title = reader.GetString(2),
+                        ManagerEmployeeId = reader.IsDBNull(3) ? null : reader.GetInt32(3)
+                    };
+                    employee.ManagedEmployees = await LoadManagedEmployeesRecursively(id);
+                    await connection.CloseAsync();
+                    return employee;
+                }
+                await connection.CloseAsync();
+                return null;
+            }
         }
 
         public async Task<IEnumerable<Employee>> GetEmployees()
         {
-            // For each subordinate, fetch their subordinates recursively
             return await LoadManagedEmployeesRecursively(null);
         }
 
-        private async Task<List<Employee>> LoadManagedEmployeesRecursively(int? id)
+        private async Task<List<Employee>> LoadManagedEmployeesRecursively(int? managerId)
         {
-            var managedEmployees = await _context.Employees
-             .Where(e => e.ManagerEmployeeId == id)
-             .Select(x => new Employee(x))
-             .ToListAsync();
+            using (var connection = new NpgsqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+                using var command = new NpgsqlCommand(
+                    @"SELECT ""EmployeeId"", ""FullName"", ""Title"", ""ManagerEmployeeId""
+                  FROM ""Employees""
+                  WHERE ""ManagerEmployeeId"" IS NOT DISTINCT FROM @ManagerId", connection);
+                command.Parameters.AddWithValue("@ManagerId", managerId ?? (object)DBNull.Value);
 
-            foreach (var employee in managedEmployees)
-                employee.ManagedEmployees = await LoadManagedEmployeesRecursively(employee.EmployeeId);
+                using var reader = await command.ExecuteReaderAsync();
+                var employees = new List<Employee>();
 
-            return managedEmployees;
+                while (await reader.ReadAsync())
+                {
+                    var employee = new Employee
+                    {
+                        EmployeeId = reader.GetInt32(0),
+                        FullName = reader.GetString(1),
+                        Title = reader.GetString(2),
+                        ManagerEmployeeId = reader.IsDBNull(3) ? null : reader.GetInt32(3)
+                    };
+                    employees.Add(employee);
+                }
+
+                foreach (var employee in employees)
+                {
+                    employee.ManagedEmployees = await LoadManagedEmployeesRecursively(employee.EmployeeId);
+                }
+                await connection.CloseAsync();
+                return employees;
+            }
         }
     }
 }
